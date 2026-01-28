@@ -1,0 +1,64 @@
+Image Caption Generation (Flickr8k) — CNN + Transformer (TensorFlow)
+
+This project implements an Image Caption Generation system using a CNN–Transformer architecture. A pre-trained EfficientNetB0 model extracts visual features from images, and a Transformer encoder–decoder generates natural language captions. The model is trained on the Flickr8k dataset, where each image contains five human-written captions.
+
+Project Structure
+
+image_project/
+│── Images/                 # Flickr8k images (8091 jpg files)
+│── captions.txt            # Captions file in format: image,caption
+│── testImages/             # Custom images for inference/testing
+│── eda_results/            # Saved EDA visualizations
+│── model_checkpoints/      # Saved trained model (.keras) + plots
+│── train.py                # Training script (your training code)
+│── inference.py            # Caption generation script (CPU-only)
+│── README.md
+
+Dataset
+
+Flickr8k Dataset
+-Total images: 8,091
+-Captions per image: 5
+-Total captions: 40,455
+-Caption format (CSV-style):
+
+Model Architecture
+
+Pipeline
+-Input image resized to 224×224
+-EfficientNetB0 (ImageNet pretrained) extracts feature map
+-Feature map reshaped into spatial tokens
+-Transformer encoder learns visual context
+-Transformer decoder generates captions word-by-word (autoregressive)
+
+Training Details
+
+Main Hyperparameters
+-Image size: 224 × 224
+-Vocabulary size: 5000
+-Sequence length: 20
+-Batch size: 32
+-Embedding dim: 256
+-Epochs: 10
+-Optimizer: Adam (lr=0.001)
+-Loss: SparseCategoricalCrossentropy(from_logits=True)
+
+Create & activate virtual environment
+
+Windows (PowerShell)
+python -m venv venv
+venv\Scripts\Activate.ps1
+
+Windows (CMD)
+python -m venv venv
+venv\Scripts\activate
+
+Linux/Mac
+python3 -m venv venv
+source venv/bin/activate
+
+Install dependencies
+pip install tensorflow matplotlib numpy seaborn wordcloud nltk
+
+Train the model
+python train.py
