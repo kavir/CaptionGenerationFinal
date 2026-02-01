@@ -1,248 +1,341 @@
-# =====================================================
-# EVALUATE (TEST) YOUR IMAGE CAPTION MODEL (NO TRAINING)
-# - Creates a random test split by IMAGE
-# - Generates captions
-# - Computes BLEU-1..BLEU-4
-# - Prints some qualitative examples
-# =====================================================
-
-import os
-import random
-import numpy as np
 import tensorflow as tf
+import numpy as np
+import json
+import re
+import argparse
+import os
 from tensorflow.keras import layers
-from tensorflow.keras.layers import TextVectorization
+from tensorflow.keras.applications import efficientnet
+from tensorflow import keras
 
-# -----------------------------
-# CPU only
-# -----------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-tf.config.set_visible_devices([], "GPU")
+# ────────────────────────────────────────────────
+# Paths — adjust only if your folder structure is different
+# ────────────────────────────────────────────────
+MODEL_CONFIG_PATH   = "save_train_dir/config_train.json"
+MODEL_WEIGHTS_PATH  = "save_train_dir/model_weights_coco.h5"
+TEXT_DATA_JSON_PATH = "COCO_dataset/text_data.json"          # must exist!
 
-# -----------------------------
-# PATHS (update if needed)
-# -----------------------------
-IMAGE_DIR = "/home/kavir/image_project/Images"
-CAPTIONS_FILE = "/home/kavir/image_project/captions.txt"
-MODEL_PATH = "/home/kavir/image_project/model_checkpoints/best_caption_model.keras"
+# Desired image dimensions (must match training)
+IMAGE_SIZE = (299, 299)
 
-# -----------------------------
-# MUST MATCH TRAINING
-# -----------------------------
-IMAGE_SIZE = (224, 224)
-SEQ_LENGTH = 20
-VOCAB_SIZE = 5000
-EMBED_DIM = 256
+# Your custom text cleaning function (exact copy from training)
+strip_chars = "!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"
 
-# -----------------------------
-# Split settings
-# -----------------------------
-TEST_RATIO = 0.10          # 10% images for test
-EVAL_MAX_IMAGES = 500      # evaluate on at most 500 test images (speed control)
-RANDOM_SEED = 42
+def custom_standardization(input_string):
+    lowercase = tf.strings.lower(input_string)
+    return tf.strings.regex_replace(lowercase, "[%s]" % re.escape(strip_chars), "")
 
-print("TensorFlow:", tf.__version__)
-print("GPUs visible:", tf.config.list_physical_devices("GPU"))
+# ────────────────────────────────────────────────
+# Utility functions
+# ────────────────────────────────────────────────
+def get_cnn_model():
+    base_model = efficientnet.EfficientNetB0(
+        input_shape=(*IMAGE_SIZE, 3),
+        include_top=False,
+        weights="imagenet",
+    )
+    base_model.trainable = False
+    base_model_out = base_model.output
+    base_model_out = layers.Reshape((-1, 1280))(base_model_out)
+    cnn_model = keras.models.Model(base_model.input, base_model_out)
+    return cnn_model
 
-# =====================================================
-# 1) LOAD CAPTIONS (image -> list of captions)
-# =====================================================
-captions_dict = {}
-all_caption_texts = []
 
-with open(CAPTIONS_FILE, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("image,caption"):
-            continue
-        parts = line.split(",", 1)
-        if len(parts) != 2:
-            continue
-        img = parts[0].strip()
-        cap = parts[1].strip()
-        if not img or not cap:
-            continue
-        captions_dict.setdefault(img, []).append(cap)
-        all_caption_texts.append("sos " + cap + " eos")
-
-print(f"Images with captions: {len(captions_dict)}")
-print(f"Total captions: {len(all_caption_texts)}")
-
-# =====================================================
-# 2) TOKENIZER (same settings as training)
-# =====================================================
-tokenizer = TextVectorization(
-    max_tokens=VOCAB_SIZE,
-    output_sequence_length=SEQ_LENGTH,
-    standardize="lower_and_strip_punctuation"
-)
-tokenizer.adapt(tf.data.Dataset.from_tensor_slices(all_caption_texts))
-vocab = tokenizer.get_vocabulary()
-vocab_set = set(vocab)
-
-FALLBACK_WORD = "a" if "a" in vocab_set else vocab[1]
-print("Tokenizer vocab size:", len(vocab))
-
-# =====================================================
-# 3) IMAGE LOADER (jpg/png safe)
-# =====================================================
-def load_image(path):
-    img = tf.io.read_file(path)
-    img = tf.io.decode_image(img, channels=3, expand_animations=False)
-    img = tf.image.resize(img, IMAGE_SIZE)
-    img = tf.cast(img, tf.float32) / 255.0
-    return img
-
-# =====================================================
-# 4) CUSTOM LAYERS (must match training)
-# =====================================================
-class TransformerEncoder(layers.Layer):
-    def __init__(self, embed_dim, num_heads=4, ff_dim=256, **kwargs):
+class TransformerEncoderBlock(layers.Layer):
+    def __init__(self, embed_dim, dense_dim, num_heads, **kwargs):
         super().__init__(**kwargs)
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
-        self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation="relu"),
-            layers.Dense(embed_dim)
-        ])
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.embed_dim = embed_dim
+        self.dense_dim = dense_dim
+        self.num_heads = num_heads
+        self.attention = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim
+        )
+        self.dense_proj = layers.Dense(embed_dim, activation="relu")
+        self.layernorm_1 = layers.LayerNormalization()
+
+    def call(self, inputs, training, mask=None):
+        inputs = self.dense_proj(inputs)
+        attention_output = self.attention(
+            query=inputs, value=inputs, key=inputs, attention_mask=None
+        )
+        proj_input = self.layernorm_1(inputs + attention_output)
+        return proj_input
+
+
+class PositionalEmbedding(layers.Layer):
+    def __init__(self, sequence_length, vocab_size, embed_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.token_embeddings = layers.Embedding(
+            input_dim=vocab_size, output_dim=embed_dim
+        )
+        self.position_embeddings = layers.Embedding(
+            input_dim=sequence_length, output_dim=embed_dim
+        )
+        self.sequence_length = sequence_length
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
 
     def call(self, inputs):
-        attn_output = self.att(inputs, inputs)
-        x = self.norm1(inputs + attn_output)
-        return self.norm2(x + self.ffn(x))
+        length = tf.shape(inputs)[-1]
+        positions = tf.range(start=0, limit=length, delta=1)
+        embedded_tokens = self.token_embeddings(inputs)
+        embedded_positions = self.position_embeddings(positions)
+        return embedded_tokens + embedded_positions
 
-class TransformerDecoder(layers.Layer):
-    def __init__(self, vocab_size, embed_dim, num_heads=4, ff_dim=512, **kwargs):
+    def compute_mask(self, inputs, mask=None):
+        return tf.math.not_equal(inputs, 0)
+
+
+class TransformerDecoderBlock(layers.Layer):
+    def __init__(self, embed_dim, ff_dim, num_heads, vocab_size, **kwargs):
         super().__init__(**kwargs)
-        self.embed = layers.Embedding(vocab_size, embed_dim)
-        self.att1 = layers.MultiHeadAttention(num_heads, embed_dim)
-        self.att2 = layers.MultiHeadAttention(num_heads, embed_dim)
-        self.ffn = tf.keras.Sequential([
-            layers.Dense(ff_dim, activation="relu"),
-            layers.Dense(embed_dim)
-        ])
-        self.norm1 = layers.LayerNormalization()
-        self.norm2 = layers.LayerNormalization()
-        self.norm3 = layers.LayerNormalization()
-        self.out = layers.Dense(vocab_size)
+        self.embed_dim = embed_dim
+        self.ff_dim = ff_dim
+        self.num_heads = num_heads
+        self.vocab_size = vocab_size
+        self.attention_1 = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim
+        )
+        self.attention_2 = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=embed_dim
+        )
+        self.dense_proj = keras.Sequential(
+            [layers.Dense(ff_dim, activation="relu"), layers.Dense(embed_dim)]
+        )
+        self.layernorm_1 = layers.LayerNormalization()
+        self.layernorm_2 = layers.LayerNormalization()
+        self.layernorm_3 = layers.LayerNormalization()
 
-    def call(self, x, enc_output):
-        x = self.embed(x)
-        x = self.norm1(x + self.att1(x, x))
-        x = self.norm2(x + self.att2(x, enc_output))
-        x = self.norm3(x + self.ffn(x))
-        return self.out(x)
+        self.embedding = PositionalEmbedding(
+            embed_dim=embed_dim, sequence_length=25, vocab_size=self.vocab_size
+        )
+        self.out = layers.Dense(self.vocab_size)
+        self.dropout_1 = layers.Dropout(0.1)
+        self.dropout_2 = layers.Dropout(0.5)
+        self.supports_masking = True
 
-# =====================================================
-# 5) LOAD MODEL
-# =====================================================
-print("\nLoading model...")
-model = tf.keras.models.load_model(
-    MODEL_PATH,
-    custom_objects={"TransformerEncoder": TransformerEncoder, "TransformerDecoder": TransformerDecoder},
-    compile=False
-)
-print("✓ Model loaded")
+    def call(self, inputs, encoder_outputs, training, mask=None):
+        inputs = self.embedding(inputs)
+        causal_mask = self.get_causal_attention_mask(inputs)
+        inputs = self.dropout_1(inputs, training=training)
 
-# =====================================================
-# 6) GENERATE CAPTION (greedy decoding)
-# =====================================================
-def generate_caption(image_path, max_length=20, min_length=3):
-    img = load_image(image_path)
-    img = tf.expand_dims(img, 0)
+        if mask is not None:
+            padding_mask = tf.cast(mask[:, :, tf.newaxis], dtype=tf.int32)
+            combined_mask = tf.cast(mask[:, tf.newaxis, :], dtype=tf.int32)
+            combined_mask = tf.minimum(combined_mask, causal_mask)
+        else:
+            combined_mask = None
+            padding_mask = None
 
-    caption = "sos"
+        attention_output_1 = self.attention_1(
+            query=inputs, value=inputs, key=inputs, attention_mask=combined_mask
+        )
+        out_1 = self.layernorm_1(inputs + attention_output_1)
 
-    for i in range(max_length):
-        seq = tokenizer([caption])
-        preds = model([img, seq], training=False)
+        attention_output_2 = self.attention_2(
+            query=out_1,
+            value=encoder_outputs,
+            key=encoder_outputs,
+            attention_mask=padding_mask
+        )
+        out_2 = self.layernorm_2(out_1 + attention_output_2)
 
-        next_id = int(tf.argmax(preds[0, -1]).numpy())
-        next_word = vocab[next_id]
+        proj_output = self.dense_proj(out_2)
+        proj_out = self.layernorm_3(out_2 + proj_output)
+        proj_out = self.dropout_2(proj_out, training=training)
 
-        # avoid stopping too early
-        if i < min_length and next_word in ("eos", "[UNK]"):
-            next_word = FALLBACK_WORD
+        preds = self.out(proj_out)
+        return preds
 
-        if next_word == "eos":
+    def get_causal_attention_mask(self, inputs):
+        input_shape = tf.shape(inputs)
+        batch_size, sequence_length = input_shape[0], input_shape[1]
+        i = tf.range(sequence_length)[:, tf.newaxis]
+        j = tf.range(sequence_length)
+        mask = tf.cast(i >= j, dtype="int32")
+        mask = tf.reshape(mask, (1, input_shape[1], input_shape[1]))
+        mult = tf.concat(
+            [tf.expand_dims(batch_size, -1), tf.constant([1, 1], dtype=tf.int32)],
+            axis=0,
+        )
+        return tf.tile(mask, mult)
+
+
+class ImageCaptioningModel(keras.Model):
+    def __init__(self, cnn_model, encoder, decoder, num_captions_per_image=5):
+        super().__init__()
+        self.cnn_model = cnn_model
+        self.encoder = encoder
+        self.decoder = decoder
+        self.num_captions_per_image = num_captions_per_image
+
+    def call(self, inputs):
+        x = self.cnn_model(inputs[0])
+        x = self.encoder(x, False)
+        x = self.decoder(inputs[2], x, training=inputs[1], mask=None)
+        return x
+
+
+def read_image_inf(img_path):
+    img = tf.io.read_file(img_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, IMAGE_SIZE)
+    img = tf.image.convert_image_dtype(img, tf.float32)
+    img = tf.expand_dims(img, axis=0)
+    return img
+
+
+def get_inference_model(model_config_path):
+    with open(model_config_path) as json_file:
+        model_config = json.load(json_file)
+
+    EMBED_DIM = model_config["EMBED_DIM"]
+    FF_DIM = model_config["FF_DIM"]
+    NUM_HEADS = model_config["NUM_HEADS"]
+    VOCAB_SIZE = model_config["VOCAB_SIZE"]
+
+    cnn_model = get_cnn_model()
+    encoder = TransformerEncoderBlock(
+        embed_dim=EMBED_DIM, dense_dim=FF_DIM, num_heads=NUM_HEADS
+    )
+    decoder = TransformerDecoderBlock(
+        embed_dim=EMBED_DIM, ff_dim=FF_DIM, num_heads=NUM_HEADS, vocab_size=VOCAB_SIZE
+    )
+    caption_model = ImageCaptioningModel(
+        cnn_model=cnn_model, encoder=encoder, decoder=decoder
+    )
+
+    # Force model initialization
+    cnn_input = tf.keras.layers.Input(shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
+    training = False
+    decoder_input = tf.keras.layers.Input(shape=(None,))
+    caption_model([cnn_input, training, decoder_input])
+
+    return caption_model
+
+
+def generate_caption(image_path, caption_model, tokenizer, seq_length):
+    vocab = tokenizer.get_vocabulary()
+    index_lookup = dict(zip(range(len(vocab)), vocab))
+    max_decoded_sentence_length = seq_length - 1
+
+    img = read_image_inf(image_path)
+    img_embed = caption_model.cnn_model(img)
+    encoded_img = caption_model.encoder(img_embed, training=False)
+
+    decoded_caption = "sos"
+    for i in range(max_decoded_sentence_length):
+        tokenized_caption = tokenizer([decoded_caption])[:, :-1]
+        mask = tf.math.not_equal(tokenized_caption, 0)
+        predictions = caption_model.decoder(
+            tokenized_caption, encoded_img, training=False, mask=mask
+        )
+        sampled_token_index = np.argmax(predictions[0, i, :])
+        sampled_token = index_lookup.get(sampled_token_index, "[UNK]")
+        if sampled_token == "eos":
             break
+        decoded_caption += " " + sampled_token
 
-        if next_word == "[UNK]":
-            next_word = FALLBACK_WORD
+    return decoded_caption.replace("sos ", "").strip()
 
-        caption += " " + next_word
 
-    result = caption.replace("sos ", "").strip()
-    return result if result else "(no caption)"
+# ────────────────────────────────────────────────
+# Main inference logic
+# ────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Image Captioning Inference")
+    parser.add_argument('--image', required=True, help="Path to input image")
+    args = parser.parse_args()
+    image_path = args.image
 
-# =====================================================
-# 7) MAKE TEST SPLIT (by image)
-# =====================================================
-random.seed(RANDOM_SEED)
-all_images = list(captions_dict.keys())
-random.shuffle(all_images)
+    if not os.path.exists(image_path):
+        print(f"Error: Image file not found → {image_path}")
+        exit(1)
 
-test_size = int(len(all_images) * TEST_RATIO)
-test_images = all_images[:test_size]
+    # ─── Tokenizer reconstruction & adaptation ───────────────────────
+    print("Re-creating tokenizer and loading vocabulary from text_data.json...")
 
-# limit for speed
-if EVAL_MAX_IMAGES and len(test_images) > EVAL_MAX_IMAGES:
-    test_images = test_images[:EVAL_MAX_IMAGES]
+    tokenizer = tf.keras.layers.TextVectorization(
+        max_tokens=2000000,
+        standardize=custom_standardization,
+        output_mode="int",
+        output_sequence_length=25
+    )
 
-print(f"\nTest images: {len(test_images)} (ratio={TEST_RATIO})")
+    if not os.path.exists(TEXT_DATA_JSON_PATH):
+        print(f"ERROR: {TEXT_DATA_JSON_PATH} not found!")
+        print("You need this file to restore the vocabulary.")
+        exit(1)
 
-# =====================================================
-# 8) BLEU EVALUATION
-# =====================================================
-try:
-    from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-    smoothie = SmoothingFunction().method4
-except ImportError:
-    raise SystemExit("NLTK not installed. Run: pip install nltk")
+    with open(TEXT_DATA_JSON_PATH, "r", encoding="utf-8") as f:
+        text_data = json.load(f)
 
-references = []
-predictions = []
+    print(f"Type of loaded data: {type(text_data).__name__}")
+    print(f"Length of loaded data: {len(text_data):,}")
 
-skipped_missing = 0
+    # Collect all captions (handle different possible formats)
+    all_captions = []
 
-for img_name in test_images:
-    img_path = os.path.join(IMAGE_DIR, img_name)
-    if not os.path.exists(img_path):
-        skipped_missing += 1
-        continue
+    if isinstance(text_data, list):
+        print("Detected: top-level list")
+        # Flat list of strings
+        if all(isinstance(item, str) for item in text_data[:200]):
+            all_captions = text_data
+            print("→ Using flat list of captions directly")
+        # List of dicts
+        elif isinstance(text_data[0], dict) if text_data else False:
+            print("→ Detected list of dictionaries")
+            for item in text_data:
+                if "caption" in item:
+                    all_captions.append(item["caption"])
+                elif "captions" in item and isinstance(item["captions"], list):
+                    all_captions.extend(item["captions"])
+                elif "text" in item:
+                    all_captions.append(item["text"])
+        else:
+            print("Warning: Could not extract captions from list items")
 
-    pred = generate_caption(img_path)
-    predictions.append(pred.split())
+    elif isinstance(text_data, dict):
+        print("Detected: top-level dictionary")
+        for value in text_data.values():
+            if isinstance(value, list):
+                all_captions.extend(value)
+            elif isinstance(value, str):
+                all_captions.append(value)
 
-    # Reference captions for that image
-    refs = [c.lower().split() for c in captions_dict[img_name]]
-    references.append(refs)
+    else:
+        print("ERROR: Unsupported format in text_data.json")
+        exit(1)
 
-print("Skipped missing files:", skipped_missing)
+    if not all_captions:
+        print("ERROR: No captions could be extracted from the file")
+        exit(1)
 
-bleu1 = corpus_bleu(references, predictions, weights=(1, 0, 0, 0), smoothing_function=smoothie)
-bleu2 = corpus_bleu(references, predictions, weights=(0.5, 0.5, 0, 0), smoothing_function=smoothie)
-bleu3 = corpus_bleu(references, predictions, weights=(0.33, 0.33, 0.33, 0), smoothing_function=smoothie)
-bleu4 = corpus_bleu(references, predictions, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoothie)
+    print(f"Extracted {len(all_captions):,} captions for tokenizer adaptation")
 
-print("\n==================== RESULTS ====================")
-print(f"BLEU-1: {bleu1:.4f}")
-print(f"BLEU-2: {bleu2:.4f}")
-print(f"BLEU-3: {bleu3:.4f}")
-print(f"BLEU-4: {bleu4:.4f}")
-print("=================================================\n")
+    # Adapt tokenizer
+    text_ds = tf.data.Dataset.from_tensor_slices(all_captions).batch(2048).prefetch(tf.data.AUTOTUNE)
+    tokenizer.adapt(text_ds)
 
-# =====================================================
-# 9) QUALITATIVE SAMPLES
-# =====================================================
-print("Sample predictions (with references):")
-for img_name in random.sample(test_images, min(5, len(test_images))):
-    img_path = os.path.join(IMAGE_DIR, img_name)
-    if not os.path.exists(img_path):
-        continue
-    pred = generate_caption(img_path)
-    print("\nImage:", img_name)
-    print("Pred :", pred)
-    for i, ref in enumerate(captions_dict[img_name][:5], 1):
-        print(f"Ref {i}:", ref)
+    vocab_size = len(tokenizer.get_vocabulary())
+    print(f"Tokenizer vocabulary built — size: {vocab_size:,}")
+    print("First 15 tokens:", tokenizer.get_vocabulary()[:15])
+
+    # ─── Load model ────────────────────────────────────────────────
+    print("\nLoading model configuration and weights...")
+    model = get_inference_model(MODEL_CONFIG_PATH)
+    model.load_weights(MODEL_WEIGHTS_PATH)
+    print("Model weights loaded successfully.")
+
+    with open(MODEL_CONFIG_PATH) as f:
+        config = json.load(f)
+    seq_length = config["SEQ_LENGTH"]
+
+    # ─── Generate caption ──────────────────────────────────────────
+    print("\nGenerating caption for:", os.path.basename(image_path))
+    try:
+        caption = generate_caption(image_path, model, tokenizer, seq_length)
+        print(f"\nPREDICTED CAPTION:\n→ {caption}")
+    except Exception as e:
+        print("Error during caption generation:")
+        print(str(e))
